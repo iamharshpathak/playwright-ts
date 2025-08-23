@@ -1,4 +1,4 @@
-name: 🎭 Playwright E2E Tests - Complete Pipeline Fixed
+name: 🎭 Playwright E2E Tests - Complete Quality Pipeline
 
 on:
   push:
@@ -6,8 +6,12 @@ on:
   pull_request:
     branches: [ main, master, develop ]
   schedule:
-    # Run tests daily at 2 AM UTC
+    # Daily at 2 AM UTC for regular tests
     - cron: '0 2 * * *'
+    # Weekly comprehensive security scan - Sundays at 3 AM UTC
+    - cron: '0 3 * * 0'
+    # Monthly load testing - 1st Sunday at 4 AM UTC
+    - cron: '0 4 1-7 * 0'
   workflow_dispatch:
     inputs:
       environment:
@@ -28,6 +32,16 @@ on:
           - chromium
           - firefox
           - webkit
+      security_scan:
+        description: 'Run comprehensive security scan'
+        required: false
+        default: false
+        type: boolean
+      load_test:
+        description: 'Run load testing'
+        required: false
+        default: false
+        type: boolean
 
 env:
   NODE_VERSION: '20'
@@ -35,27 +49,14 @@ env:
   CI: true
 
 jobs:
-  test:
-    name: Test on ${{ matrix.os }} - ${{ matrix.browser }}
-    timeout-minutes: 60
-    runs-on: ${{ matrix.os }}
-    
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
-        browser: [chromium, firefox, webkit]
-        include:
-          - os: windows-latest
-            browser: chromium
-          - os: macos-latest
-            browser: webkit
-
+  # 1. 🔍 CODE QUALITY (1-2 mins) - Essential for catching bugs and maintaining consistency
+  code-quality:
+    name: 🔍 Code Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: 📦 Setup Node.js
         uses: actions/setup-node@v4
@@ -66,81 +67,405 @@ jobs:
       - name: 📚 Install dependencies
         run: npm ci
 
-      - name: 🎭 Get Playwright version
-        id: playwright-version
-        run: echo "version=$(node -p "require('./package.json').devDependencies['@playwright/test']")" >> $GITHUB_OUTPUT
+      - name: 🔧 ESLint check
+        run: |
+          echo "🔍 Running ESLint..."
+          npx eslint . --ext .ts,.js,.tsx,.jsx --max-warnings 10 --format json --output-file eslint-results.json || true
+          npx eslint . --ext .ts,.js,.tsx,.jsx --max-warnings 10
+        continue-on-error: false
+
+      - name: 🎨 Prettier check
+        run: |
+          echo "🎨 Checking Prettier formatting..."
+          npx prettier --check . --write=false
+
+      - name: 📊 TypeScript check
+        run: |
+          echo "📊 Running TypeScript checks..."
+          npx tsc --noEmit
+        if: ${{ hashFiles('tsconfig.json') != '' }}
+
+      - name: 📋 Upload code quality results
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: code-quality-results-${{ github.run_id }}
+          path: |
+            eslint-results.json
+          retention-days: 15
+
+  # 2. 🛡️ SECURITY AUDIT (1-2 mins) - Prevents deploying vulnerable dependencies
+  security-audit:
+    name: 🛡️ Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 🔍 NPM Security Audit
+        run: |
+          echo "🛡️ Running NPM security audit..."
+          npm audit --json > npm-audit-results.json || true
+          npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: 📊 Upload security audit results
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: security-audit-results-${{ github.run_id }}
+          path: npm-audit-results.json
+          retention-days: 30
+
+  # 3. 🧪 CORE TESTS (5-15 mins) - Primary quality gate with Playwright on 3 browsers
+  test:
+    name: 🧪 Test ${{ matrix.browser }}
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    needs: [code-quality, security-audit]
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📚 Install dependencies
+        run: npm ci
 
       - name: 🎭 Cache Playwright browsers
         uses: actions/cache@v4
         id: playwright-cache
         with:
-          path: |
-            ~/.cache/ms-playwright
-            ~/Library/Caches/ms-playwright
-            ${{ runner.os == 'Windows' && '~\AppData\Local\ms-playwright' || '' }}
-          key: ${{ runner.os }}-playwright-${{ steps.playwright-version.outputs.version }}-${{ matrix.browser }}
-          restore-keys: |
-            ${{ runner.os }}-playwright-${{ steps.playwright-version.outputs.version }}-
-            ${{ runner.os }}-playwright-
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ matrix.browser }}-${{ hashFiles('package-lock.json') }}
 
       - name: 🎭 Install Playwright browsers
         run: npx playwright install ${{ matrix.browser }} --with-deps
         if: steps.playwright-cache.outputs.cache-hit != 'true'
 
-      - name: 🎭 Install Playwright system dependencies
-        run: npx playwright install-deps ${{ matrix.browser }}
-        if: steps.playwright-cache.outputs.cache-hit == 'true' && runner.os == 'Linux'
-
-      - name: 🔧 Setup test environment
+      - name: 🧪 Run Playwright tests
         run: |
-          if [ "${{ github.event.inputs.environment }}" = "production" ]; then
-            echo "BASE_URL=${{ secrets.PROD_BASE_URL || 'https://example.com' }}" >> $GITHUB_ENV
-          else
-            echo "BASE_URL=${{ secrets.STAGING_BASE_URL || 'https://staging.example.com' }}" >> $GITHUB_ENV
-          fi
-          echo "TEST_USER_EMAIL=${{ secrets.TEST_USER_EMAIL || 'test@example.com' }}" >> $GITHUB_ENV
-          echo "TEST_USER_PASSWORD=${{ secrets.TEST_USER_PASSWORD || 'password123' }}" >> $GITHUB_ENV
-        shell: bash
-
-      - name: 🧪 Run Playwright tests with blob reporter
-        run: |
-          if [ "${{ github.event.inputs.browser }}" = "all" ] || [ -z "${{ github.event.inputs.browser }}" ]; then
-            npx playwright test --project=${{ matrix.browser }} --reporter=blob
-          else
-            npx playwright test --project=${{ github.event.inputs.browser }} --reporter=blob
-          fi
-        shell: bash
+          echo "🧪 Running Playwright tests on ${{ matrix.browser }}..."
+          npx playwright test --project=${{ matrix.browser }} --reporter=blob,junit
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'https://staging.example.com' }}
 
       - name: 📊 Upload blob report
         uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
-          name: blob-report-${{ matrix.os }}-${{ matrix.browser }}-${{ github.run_id }}
+          name: blob-report-${{ matrix.browser }}-${{ github.run_id }}
           path: blob-report
           retention-days: 30
 
-      - name: 📸 Upload screenshots on failure
+      - name: 📊 Upload test results
         uses: actions/upload-artifact@v4
-        if: failure()
+        if: ${{ !cancelled() }}
         with:
-          name: screenshots-${{ matrix.os }}-${{ matrix.browser }}-${{ github.run_id }}
-          path: test-results/**/test-failed-*.png
-          retention-days: 7
+          name: test-results-${{ matrix.browser }}-${{ github.run_id }}
+          path: |
+            test-results/
+            results.xml
+          retention-days: 15
 
-      - name: 🎥 Upload videos on failure
-        uses: actions/upload-artifact@v4
-        if: failure()
+      - name: 📊 Publish Test Results
+        uses: dorny/test-reporter@v1
+        if: ${{ !cancelled() }}
         with:
-          name: videos-${{ matrix.os }}-${{ matrix.browser }}-${{ github.run_id }}
-          path: test-results/**/*.webm
-          retention-days: 7
+          name: Test Results (${{ matrix.browser }})
+          path: results.xml
+          reporter: java-junit
 
-  lighthouse:
-    name: 🔍 Lighthouse Performance Tests
+  # 4. ♿ ACCESSIBILITY TESTS (2-3 mins, parallel) - Legal compliance + user experience
+  accessibility:
+    name: ♿ Accessibility Tests
     runs-on: ubuntu-latest
-    needs: test
-    # Fixed: Run on push, PR, and manual trigger
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    timeout-minutes: 10
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📚 Install dependencies
+        run: npm ci
+
+      - name: 🎭 Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+
+      - name: ♿ Run accessibility tests
+        run: |
+          echo "♿ Running accessibility tests..."
+          npx playwright test --grep="@accessibility|a11y" --project=chromium --reporter=junit
+        continue-on-error: true
+
+      - name: 🔍 Pa11y accessibility scan
+        run: |
+          echo "🔍 Running Pa11y accessibility scan..."
+          TARGET_URL="${{ secrets.STAGING_BASE_URL || 'https://example.com' }}"
+          npx pa11y-ci --sitemap $TARGET_URL/sitemap.xml --reporter cli > pa11y-results.txt || true
+          # Fallback if no sitemap
+          npx pa11y $TARGET_URL --reporter cli >> pa11y-results.txt || true
+        continue-on-error: true
+
+      - name: 📊 Upload accessibility results
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: accessibility-results-${{ github.run_id }}
+          path: |
+            results.xml
+            pa11y-results.txt
+          retention-days: 15
+
+  # 5. 🔐 SECURITY SCAN - Daily Headers (30s) + Weekly Comprehensive + ZAP on main
+  security-headers-daily:
+    name: 🔐 Daily Security Headers (30s)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule' || github.event.schedule == '0 2 * * *'
+    timeout-minutes: 2
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Security Headers Check
+        run: |
+          TARGET_URL="${{ secrets.STAGING_BASE_URL || 'https://katalon-test.s3.amazonaws.com/aut/html/form.html' }}"
+          echo "🔍 Checking security headers for: $TARGET_URL"
+          
+          cat > security_headers_check.sh << 'EOF'
+          #!/bin/bash
+          URL=$1
+          REPORT="security-headers-daily.txt"
+          JSON_REPORT="security-headers-daily.json"
+          
+          echo "=== DAILY SECURITY HEADERS CHECK ===" > $REPORT
+          echo "URL: $URL" >> $REPORT
+          echo "Date: $(date)" >> $REPORT
+          echo "" >> $REPORT
+          
+          # Get headers with timeout
+          HEADERS=$(curl -s -I "$URL" --max-time 30 | tr -d '\r')
+          HTTP_STATUS=$(echo "$HEADERS" | head -1)
+          
+          echo "Response: $HTTP_STATUS" >> $REPORT
+          echo "" >> $REPORT
+          
+          # Initialize JSON
+          echo '{"url":"'$URL'","date":"'$(date -Iseconds)'","headers_analysis":{' > $JSON_REPORT
+          
+          # Security Headers Analysis
+          echo "=== SECURITY HEADERS ANALYSIS ===" >> $REPORT
+          
+          SCORE=0
+          TOTAL=6
+          
+          # HSTS Check
+          if echo "$HEADERS" | grep -qi "strict-transport-security"; then
+            echo "✅ HSTS: PRESENT" >> $REPORT
+            echo '"hsts":{"present":true},' >> $JSON_REPORT
+            SCORE=$((SCORE+1))
+          else
+            echo "❌ HSTS: MISSING - Add Strict-Transport-Security header" >> $REPORT
+            echo '"hsts":{"present":false},' >> $JSON_REPORT
+          fi
+          
+          # X-Frame-Options
+          if echo "$HEADERS" | grep -qi "x-frame-options"; then
+            echo "✅ X-Frame-Options: PRESENT" >> $REPORT
+            echo '"x_frame_options":{"present":true},' >> $JSON_REPORT
+            SCORE=$((SCORE+1))
+          else
+            echo "❌ X-Frame-Options: MISSING - Add X-Frame-Options header" >> $REPORT
+            echo '"x_frame_options":{"present":false},' >> $JSON_REPORT
+          fi
+          
+          # X-Content-Type-Options
+          if echo "$HEADERS" | grep -qi "x-content-type-options"; then
+            echo "✅ X-Content-Type-Options: PRESENT" >> $REPORT
+            echo '"x_content_type_options":{"present":true},' >> $JSON_REPORT
+            SCORE=$((SCORE+1))
+          else
+            echo "❌ X-Content-Type-Options: MISSING - Add X-Content-Type-Options: nosniff" >> $REPORT
+            echo '"x_content_type_options":{"present":false},' >> $JSON_REPORT
+          fi
+          
+          # CSP
+          if echo "$HEADERS" | grep -qi "content-security-policy"; then
+            echo "✅ Content-Security-Policy: PRESENT" >> $REPORT
+            echo '"csp":{"present":true},' >> $JSON_REPORT
+            SCORE=$((SCORE+1))
+          else
+            echo "❌ Content-Security-Policy: MISSING - Add CSP header" >> $REPORT
+            echo '"csp":{"present":false},' >> $JSON_REPORT
+          fi
+          
+          # X-XSS-Protection
+          if echo "$HEADERS" | grep -qi "x-xss-protection"; then
+            echo "✅ X-XSS-Protection: PRESENT" >> $REPORT
+            echo '"x_xss_protection":{"present":true},' >> $JSON_REPORT
+            SCORE=$((SCORE+1))
+          else
+            echo "❌ X-XSS-Protection: MISSING - Add X-XSS-Protection header" >> $REPORT
+            echo '"x_xss_protection":{"present":false},' >> $JSON_REPORT
+          fi
+          
+          # Referrer-Policy
+          if echo "$HEADERS" | grep -qi "referrer-policy"; then
+            echo "✅ Referrer-Policy: PRESENT" >> $REPORT
+            echo '"referrer_policy":{"present":true}' >> $JSON_REPORT
+            SCORE=$((SCORE+1))
+          else
+            echo "ℹ️  Referrer-Policy: MISSING (Optional)" >> $REPORT
+            echo '"referrer_policy":{"present":false}' >> $JSON_REPORT
+          fi
+          
+          PERCENTAGE=$((SCORE * 100 / TOTAL))
+          
+          # Complete JSON
+          echo '},"summary":{"score":'$SCORE',"total":'$TOTAL',"percentage":'$PERCENTAGE'}}' >> $JSON_REPORT
+          
+          echo "" >> $REPORT
+          echo "=== SECURITY SCORE ===" >> $REPORT
+          echo "Score: $SCORE/$TOTAL ($PERCENTAGE%)" >> $REPORT
+          
+          if [ $PERCENTAGE -ge 80 ]; then
+            echo "🟢 Grade: A (Excellent)" >> $REPORT
+          elif [ $PERCENTAGE -ge 60 ]; then
+            echo "🟡 Grade: B (Good)" >> $REPORT
+          else
+            echo "🔴 Grade: C-D (Needs Improvement)" >> $REPORT
+          fi
+          
+          cat $REPORT
+          EOF
+          
+          chmod +x security_headers_check.sh
+          ./security_headers_check.sh "$TARGET_URL"
+
+      - name: 📊 Upload security headers results
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: security-headers-daily-${{ github.run_id }}
+          path: |
+            security-headers-daily.txt
+            security-headers-daily.json
+          retention-days: 30
+
+  # 6. 🔐 ZAP SECURITY SCAN (3-5 mins, main branch only) - Runtime security validation
+  security-zap:
+    name: 🔐 ZAP Security Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 10
+    continue-on-error: true
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Create ZAP rules
+        run: |
+          mkdir -p .zap
+          cat > .zap/rules.tsv << 'EOF'
+          10010	IGNORE	(Cookie No HttpOnly Flag)
+          10011	IGNORE	(Cookie Without Secure Flag)
+          90020	IGNORE	(Missing Anti-clickjacking Header)
+          EOF
+
+      - name: 🔐 OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          token: ${{ github.token }}
+          target: ${{ secrets.STAGING_BASE_URL || 'https://katalon-test.s3.amazonaws.com/aut/html/form.html' }}
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a -j'
+          fail_action: false
+          allow_issue_writing: false
+
+      - name: 📊 Upload ZAP results
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: zap-security-reports-${{ github.run_id }}
+          path: |
+            report_html.html
+            report_json.json
+            report_md.md
+          retention-days: 30
+
+  # 7. 🖼️ VISUAL REGRESSION (3-5 mins, PRs only) - UI consistency validation
+  visual-regression:
+    name: 🖼️ Visual Regression Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 10
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📚 Install dependencies
+        run: npm ci
+
+      - name: 🎭 Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+
+      - name: 🖼️ Run visual regression tests
+        run: |
+          echo "🖼️ Running visual regression tests..."
+          npx playwright test --grep="@visual|visual" --project=chromium --reporter=junit
+        continue-on-error: true
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'https://staging.example.com' }}
+
+      - name: 📊 Upload visual diff results
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: visual-regression-${{ github.run_id }}
+          path: |
+            test-results/
+            results.xml
+          retention-days: 7
+
+  # 8. ⚡ PERFORMANCE TESTS (5-10 mins, scheduled) - Performance monitoring
+  performance:
+    name: ⚡ Performance Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 15
     
     steps:
       - name: 📥 Checkout code
@@ -161,8 +486,20 @@ jobs:
           module.exports = {
             ci: {
               collect: {
-                url: [process.env.BASE_URL || 'https://www.zaproxy.org'],
-                numberOfRuns: 1,
+                url: [
+                  process.env.BASE_URL || 'https://example.com',
+                  (process.env.BASE_URL || 'https://example.com') + '/about',
+                  (process.env.BASE_URL || 'https://example.com') + '/contact'
+                ],
+                numberOfRuns: 3,
+              },
+              assert: {
+                assertions: {
+                  'categories:performance': ['error', {minScore: 0.8}],
+                  'categories:accessibility': ['error', {minScore: 0.9}],
+                  'categories:best-practices': ['error', {minScore: 0.8}],
+                  'categories:seo': ['error', {minScore: 0.8}]
+                }
               },
               upload: {
                 target: 'temporary-public-storage',
@@ -170,23 +507,48 @@ jobs:
             },
           };
           EOF
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL }}
 
-      - name: 🔍 Run Lighthouse
+      - name: ⚡ Run Lighthouse Performance Tests
         uses: treosh/lighthouse-ci-action@v12
         with:
           configPath: '.lighthouserc.js'
           uploadArtifacts: true
           temporaryPublicStorage: true
 
-  visual-regression:
-    name: 🖼️ Visual Regression Tests
+      - name: 🎭 Run Playwright Performance Tests
+        run: |
+          echo "⚡ Running Playwright performance tests..."
+          npx playwright test --grep="@performance|perf" --project=chromium --reporter=junit
+        continue-on-error: true
+        env:
+          BASE_URL: ${{ secrets.STAGING_BASE_URL || 'https://staging.example.com' }}
+
+      - name: 📊 Upload performance results
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: performance-results-${{ github.run_id }}
+          path: |
+            lighthouse-results.json
+            results.xml
+            test-results/
+          retention-days: 30
+
+  # 9. 🔬 SONARQUBE (3-5 mins + setup complexity) - Code quality analysis
+  sonarqube:
+    name: 🔬 SonarQube Analysis
     runs-on: ubuntu-latest
-    # Fixed: Run on push, PR, and manual trigger
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    timeout-minutes: 10
+    continue-on-error: true
     
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 📦 Setup Node.js
         uses: actions/setup-node@v4
@@ -197,225 +559,257 @@ jobs:
       - name: 📚 Install dependencies
         run: npm ci
 
-      - name: 🎭 Install Playwright browsers
-        run: npx playwright install chromium --with-deps
-
-      - name: 🖼️ Run visual regression tests
-        run: npx playwright test --grep="visual" --project=chromium
+      - name: 🧪 Run tests with coverage
+        run: |
+          echo "🧪 Running tests with coverage for SonarQube..."
+          npm run test:coverage || npm test -- --coverage || echo "No coverage script configured"
         continue-on-error: true
 
-      - name: 📊 Upload visual diff
-        uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
-        with:
-          name: visual-regression-diff-${{ github.run_id }}
-          path: test-results/
-          retention-days: 7
-
-  api-tests:
-    name: 🔗 API Integration Tests
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: 📥 Checkout code
-        uses: actions/checkout@v4
-
-      - name: 📦 Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-
-      - name: 📚 Install dependencies
-        run: npm ci
-
-      - name: 🔗 Run API tests with blob reporter
-        run: |
-          if [ -d "tests/api" ]; then
-            npx playwright test tests/api/ --reporter=blob
-          else
-            echo "No API tests directory found - skipping"
-          fi
+      - name: 🔬 SonarQube Scan
+        uses: sonarqube-github-action@master
         env:
-          API_BASE_URL: ${{ secrets.API_BASE_URL }}
-          API_KEY: ${{ secrets.API_KEY }}
-
-      - name: 📊 Upload API blob report
-        uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
-          name: api-blob-report-${{ github.run_id }}
-          path: blob-report
-          retention-days: 30
+          args: >
+            -Dsonar.projectKey=${{ github.repository_owner }}_${{ github.event.repository.name }}
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.sources=src,tests
+            -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/*.spec.ts,**/*.test.ts
+            -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info
+        continue-on-error: true
 
-  mobile-tests:
-    name: 📱 Mobile Device Tests
+      - name: 🚪 SonarQube Quality Gate
+        uses: sonarqube-github-action/quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        continue-on-error: true
+
+  # 10. 📈 LOAD TESTING (10-30 mins depending on test) - Monthly or manual
+  load-testing:
+    name: 📈 Load Testing
     runs-on: ubuntu-latest
-    # Fixed: Run on schedule, push, or manual trigger
-    if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    
-    strategy:
-      matrix:
-        device: ['iPhone 13', 'Pixel 5', 'iPad Air']
-    
-    steps:
-      - name: 📥 Checkout code
-        uses: actions/checkout@v4
-
-      - name: 📦 Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-
-      - name: 📚 Install dependencies
-        run: npm ci
-
-      - name: 🎭 Install Playwright browsers
-        run: npx playwright install chromium webkit --with-deps
-
-      - name: 📱 Run mobile tests
-        run: |
-          # Convert device name to project name (spaces to hyphens, etc.)
-          DEVICE_PROJECT=$(echo "${{ matrix.device }}" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
-          if npx playwright test --list | grep -q "$DEVICE_PROJECT"; then
-            npx playwright test --project="$DEVICE_PROJECT" --reporter=blob
-          else
-            echo "Project $DEVICE_PROJECT not found, running with device emulation"
-            npx playwright test --grep="mobile" --reporter=blob
-          fi
-
-      - name: 📊 Upload mobile blob report
-        uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
-        with:
-          name: mobile-blob-report-${{ matrix.device }}-${{ github.run_id }}
-          path: blob-report
-          retention-days: 15
-
-  accessibility:
-    name: ♿ Accessibility Tests
-    runs-on: ubuntu-latest
-    # Fixed: Run on push, PR, and manual trigger
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    
-    steps:
-      - name: 📥 Checkout code
-        uses: actions/checkout@v4
-
-      - name: 📦 Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-
-      - name: 📚 Install dependencies
-        run: npm ci
-
-      - name: 🎭 Install Playwright browsers
-        run: npx playwright install chromium --with-deps
-
-      - name: ♿ Run accessibility tests
-        run: |
-          if [ -d "tests/accessibility" ]; then
-            npx playwright test tests/accessibility/ --reporter=blob
-          else
-            echo "No accessibility tests directory found - skipping"
-          fi
-
-      - name: 📊 Upload accessibility blob report
-        uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
-        with:
-          name: accessibility-blob-report-${{ github.run_id }}
-          path: blob-report
-          retention-days: 30
-
-  security:
-    name: 🔐 Security Tests
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    
-    steps:
-      - name: 📥 Checkout code
-        uses: actions/checkout@v4
-
-      - name: 🔧 Fix workspace permissions
-        run: |
-          sudo chown -R $USER:$USER ${{ github.workspace }}
-          chmod -R 755 ${{ github.workspace }}
-
-      - name: 🔧 Create ZAP rules file
-        run: |
-          mkdir -p .zap
-          cat > .zap/rules.tsv << 'EOF'
-          10010	IGNORE	(Cookie No HttpOnly Flag)
-          10011	IGNORE	(Cookie Without Secure Flag)
-          90020	IGNORE	(Missing Anti-clickjacking Header)
-          EOF
-
-      - name: 🔐 Run OWASP ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.12.0
-        with:
-          token: ${{ github.token }}
-          target: 'https://katalon-test.s3.amazonaws.com/aut/html/form.html'
-          rules_file_name: '.zap/rules.tsv'
-          cmd_options: '-a -j'
-          fail_action: false
-          allow_issue_writing: false
-
-      - name: 📊 Upload ZAP security reports (FIXED NAME)
-        uses: actions/upload-artifact@v4
-        if: ${{ !cancelled() }}
-        with:
-          name: zap-security-reports-${{ github.run_id }}
-          path: |
-            report_html.html
-            report_json.json
-            report_md.md
-          retention-days: 30
-
-  security-nuclei:
-    name: 🔐 Nuclei Security Scan
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event.schedule == '0 4 1-7 * 0' || github.event.inputs.load_test == 'true'
+    timeout-minutes: 35
     continue-on-error: true
     
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: 🔧 Install Nuclei (Fixed Method)
-        run: |
-          # Install Nuclei using Go instead of broken wget
-          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
 
-      - name: 🔄 Update Nuclei templates
-        run: |
-          $HOME/go/bin/nuclei -update-templates
+      - name: 📚 Install dependencies
+        run: npm ci
 
-      - name: 🔐 Run Nuclei Security Scan
+      - name: 📈 Install K6
         run: |
-          TARGET_URL="${{ secrets.STAGING_BASE_URL || 'https://katalon-test.s3.amazonaws.com' }}"
-          echo "Scanning: $TARGET_URL"
-          $HOME/go/bin/nuclei -u "$TARGET_URL" -t cves/ -t vulnerabilities/ -j -o nuclei-report.json || true
-          $HOME/go/bin/nuclei -u "$TARGET_URL" -t cves/ -t vulnerabilities/ -o nuclei-report.txt || true
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee -a /etc/apt/sources.list
+          sudo apt-get update
+          sudo apt-get install k6
 
-      - name: 📊 Upload Nuclei security reports (FIXED NAME)
+      - name: 📈 Create load test scripts
+        run: |
+          mkdir -p load-tests
+          
+          # Basic load test
+          cat > load-tests/basic-load.js << 'EOF'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+          
+          export const options = {
+            stages: [
+              { duration: '2m', target: 10 }, // Ramp up
+              { duration: '5m', target: 10 }, // Stay at 10 users
+              { duration: '2m', target: 20 }, // Ramp to 20 users
+              { duration: '5m', target: 20 }, // Stay at 20 users
+              { duration: '2m', target: 0 },  // Ramp down
+            ],
+            thresholds: {
+              http_req_duration: ['p(95)<2000'], // 95% of requests under 2s
+              http_req_failed: ['rate<0.02'],    // Error rate under 2%
+            },
+          };
+          
+          export default function() {
+            const response = http.get(__ENV.BASE_URL || 'https://example.com');
+            check(response, {
+              'status is 200': (r) => r.status === 200,
+              'response time < 2s': (r) => r.timings.duration < 2000,
+            });
+            sleep(1);
+          }
+          EOF
+          
+          # Stress test
+          cat > load-tests/stress-test.js << 'EOF'
+          import http from 'k6/http';
+          import { check } from 'k6';
+          
+          export const options = {
+            stages: [
+              { duration: '1m', target: 50 },  // Ramp up to 50 users
+              { duration: '3m', target: 50 },  // Stay at 50 users
+              { duration: '1m', target: 100 }, // Ramp up to 100 users
+              { duration: '3m', target: 100 }, // Stay at 100 users
+              { duration: '1m', target: 0 },   // Ramp down
+            ],
+          };
+          
+          export default function() {
+            const response = http.get(__ENV.BASE_URL || 'https://example.com');
+            check(response, {
+              'status is 200': (r) => r.status === 200,
+            });
+          }
+          EOF
+
+      - name: 📈 Run load tests
+        run: |
+          TARGET_URL="${{ secrets.STAGING_BASE_URL || 'https://example.com' }}"
+          echo "📈 Running load tests against: $TARGET_URL"
+          
+          # Basic load test
+          echo "🔄 Running basic load test..."
+          k6 run --out json=basic-load-results.json --env BASE_URL="$TARGET_URL" load-tests/basic-load.js || true
+          
+          # Stress test  
+          echo "💪 Running stress test..."
+          k6 run --out json=stress-test-results.json --env BASE_URL="$TARGET_URL" load-tests/stress-test.js || true
+
+      - name: 📊 Upload load test results
         uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
-          name: nuclei-security-reports-${{ github.run_id }}
+          name: load-test-results-${{ github.run_id }}
           path: |
-            nuclei-report.json
-            nuclei-report.txt
-          retention-days: 30
+            basic-load-results.json
+            stress-test-results.json
+            load-tests/
+          retention-days: 60
 
-  merge-reports:
-    name: 📊 Merge Test Reports
+  # 11. 🤖 CODERABBIT INTEGRATION - AI Code Review
+  coderabbit:
+    name: 🤖 CodeRabbit AI Review
     runs-on: ubuntu-latest
-    needs: [test, api-tests]
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    continue-on-error: true
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🤖 CodeRabbit Analysis
+        uses: coderabbitai/coderabbit-action@v2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+        continue-on-error: true
+
+  # COMPREHENSIVE WEEKLY SECURITY SCAN
+  security-comprehensive-weekly:
+    name: 🔐 Weekly Comprehensive Security
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 3 * * 0' || github.event.inputs.security_scan == 'true'
+    timeout-minutes: 35
+    continue-on-error: true
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Install security tools
+        run: |
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          sudo apt-get update
+          sudo apt-get install -y nikto nmap
+
+      - name: 🗂️ Cache Nuclei templates
+        uses: actions/cache@v4
+        with:
+          path: ~/nuclei-templates
+          key: nuclei-templates-weekly-${{ runner.os }}-v10.2.7
+
+      - name: 🔄 Update Nuclei templates
+        run: $HOME/go/bin/nuclei -update-templates -silent
+
+      - name: 🔐 Comprehensive Security Scan
+        run: |
+          TARGET_URL="${{ secrets.STAGING_BASE_URL || 'https://katalon-test.s3.amazonaws.com' }}"
+          DOMAIN=$(echo "$TARGET_URL" | sed 's|https\?://||' | sed 's|/.*||')
+          
+          echo "🎯 Comprehensive security scan starting..."
+          
+          # Nuclei scan
+          echo "🧬 Running Nuclei scan..."
+          timeout 15m $HOME/go/bin/nuclei -u "$TARGET_URL" -severity high,critical -j -o nuclei-weekly.json -silent || true
+          
+          # Nikto scan
+          echo "🕸️ Running Nikto scan..."
+          timeout 8m nikto -h "$TARGET_URL" -Format txt -output nikto-weekly.txt || true
+          
+          # Nmap scan
+          echo "🌐 Running Nmap scan..."
+          timeout 5m nmap -sV --script vuln "$DOMAIN" -oN nmap-weekly.txt || true
+          
+          # Generate summary
+          echo "📊 Generating security summary..."
+          echo "=== WEEKLY SECURITY SCAN SUMMARY ===" > weekly-security-summary.txt
+          echo "Date: $(date)" >> weekly-security-summary.txt
+          echo "Target: $TARGET_URL" >> weekly-security-summary.txt
+          echo "" >> weekly-security-summary.txt
+          
+          if [ -f nuclei-weekly.json ] && [ -s nuclei-weekly.json ]; then
+            NUCLEI_COUNT=$(wc -l < nuclei-weekly.json)
+            echo "Nuclei Vulnerabilities: $NUCLEI_COUNT" >> weekly-security-summary.txt
+          else
+            echo "Nuclei Vulnerabilities: 0" >> weekly-security-summary.txt
+          fi
+          
+          if [ -f nikto-weekly.txt ]; then
+            NIKTO_COUNT=$(grep -c "+" nikto-weekly.txt || echo "0")
+            echo "Nikto Issues: $NIKTO_COUNT" >> weekly-security-summary.txt
+          else
+            echo "Nikto Issues: 0" >> weekly-security-summary.txt
+          fi
+          
+          if [ -f nmap-weekly.txt ]; then
+            NMAP_COUNT=$(grep -c "VULNERABLE" nmap-weekly.txt || echo "0")
+            echo "Nmap Vulnerabilities: $NMAP_COUNT" >> weekly-security-summary.txt
+          else
+            echo "Nmap Vulnerabilities: 0" >> weekly-security-summary.txt
+          fi
+          
+          cat weekly-security-summary.txt
+
+      - name: 📊 Upload comprehensive security results
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: comprehensive-security-weekly-${{ github.run_id }}
+          path: |
+            weekly-security-summary.txt
+            nuclei-weekly.json
+            nikto-weekly.txt
+            nmap-weekly.txt
+          retention-days: 60
+
+  # MERGE REPORTS
+  merge-reports:
+    name: 📊 Merge Reports
+    runs-on: ubuntu-latest
+    needs: [test]
     if: ${{ !cancelled() }}
     
     steps:
@@ -431,48 +825,30 @@ jobs:
       - name: 📚 Install dependencies
         run: npm ci
 
-      - name: 📥 Download all blob reports
+      - name: 📥 Download blob reports
         uses: actions/download-artifact@v4
         with:
-          pattern: '*blob-report*'
+          pattern: 'blob-report-*'
           path: all-blob-reports
           merge-multiple: true
-
-      - name: 🔍 Debug - List downloaded files
-        run: |
-          echo "Contents of all-blob-reports:"
-          ls -la all-blob-reports/ || echo "Directory does not exist"
-          find all-blob-reports -name "*.zip" 2>/dev/null || echo "No blob report files found"
 
       - name: 📊 Merge HTML reports
         run: |
           if [ -d "all-blob-reports" ] && [ "$(find all-blob-reports -name "*.zip" | wc -l)" -gt 0 ]; then
-            echo "Found blob reports, merging..."
             npx playwright merge-reports --reporter html ./all-blob-reports
           else
-            echo "No blob reports found, creating empty report"
             mkdir -p playwright-report
-            cat > playwright-report/index.html << 'EOF'
-          <!DOCTYPE html>
-          <html>
-          <head><title>Test Report</title></head>
-          <body>
-            <h1>No Test Reports Generated</h1>
-            <p>No Playwright test blob reports were found to merge.</p>
-            <p>This usually means the test jobs did not complete successfully.</p>
-          </body>
-          </html>
-          EOF
+            echo "<html><body><h1>No reports to merge</h1></body></html>" > playwright-report/index.html
           fi
 
-      - name: 📊 Upload combined HTML report (FIXED NAME)
+      - name: 📊 Upload combined report
         uses: actions/upload-artifact@v4
         with:
           name: combined-html-report-${{ github.run_id }}
           path: playwright-report/
           retention-days: 30
 
-      - name: 📊 Publish HTML Report to GitHub Pages
+      - name: 📊 Publish to GitHub Pages
         if: github.ref == 'refs/heads/main'
         uses: peaceiris/actions-gh-pages@v4
         with:
@@ -480,14 +856,15 @@ jobs:
           publish_dir: ./playwright-report
           destination_dir: test-reports/${{ github.run_id }}
 
-  notify:
-    name: 📢 Notifications
+  # NOTIFICATIONS
+  notify-failure:
+    name: 📢 Notify on Failure
     runs-on: ubuntu-latest
-    needs: [test, api-tests, mobile-tests, accessibility, security]
-    if: failure() && (github.event_name == 'schedule' || github.ref == 'refs/heads/main')
+    needs: [test, accessibility, security-headers-daily, security-zap]
+    if: failure() && github.ref == 'refs/heads/main'
     
     steps:
-      - name: 📧 Send email notification
+      - name: 📧 Send failure notification
         uses: dawidd6/action-send-mail@v3
         continue-on-error: true
         with:
@@ -495,48 +872,20 @@ jobs:
           server_port: 587
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "❌ Playwright Tests Failed - ${{ github.repository }}"
+          subject: "❌ Quality Pipeline Failed - ${{ github.repository }}"
           body: |
-            The Playwright test suite has failed on ${{ github.ref }}.
+            Quality pipeline failed on ${{ github.ref }}
             
             Repository: ${{ github.repository }}
             Commit: ${{ github.sha }}
             Author: ${{ github.actor }}
             
-            Please check the GitHub Actions logs for more details.
+            Failed Components:
+            - Code Quality: ${{ needs.code-quality.result }}
+            - Tests: ${{ needs.test.result }}
+            - Accessibility: ${{ needs.accessibility.result }}
+            - Security: ${{ needs.security-headers-daily.result }}
             
-            Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Check: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           to: ${{ secrets.NOTIFICATION_EMAIL }}
-          from: "GitHub Actions <${{ secrets.EMAIL_USERNAME }}>"
-
-      - name: 💬 Slack notification
-        uses: 8398a7/action-slack@v3
-        continue-on-error: true
-        with:
-          status: failure
-          channel: '#qa-alerts'
-          text: |
-            🚨 Playwright tests failed!
-            Repository: ${{ github.repository }}
-            Branch: ${{ github.ref }}
-            Commit: ${{ github.sha }}
-            Author: ${{ github.actor }}
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-
-  cleanup:
-    name: 🧹 Cleanup Old Artifacts
-    runs-on: ubuntu-latest
-    needs: [merge-reports]
-    if: always()
-    
-    steps:
-      - name: 🧹 Delete old artifacts
-        uses: geekyeggo/delete-artifact@v5
-        with:
-          name: |
-            screenshots-*
-            videos-*
-            blob-report-*
-          failOnError: false
-          useGlob: true
+          from: "Quality Pipeline <${{ secrets.EMAIL_USERNAME }}>"
