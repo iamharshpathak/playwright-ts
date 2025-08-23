@@ -156,6 +156,22 @@ jobs:
       - name: 📚 Install dependencies
         run: npm ci
 
+      - name: 🔧 Create Lighthouse config
+        run: |
+          cat > .lighthouserc.js << 'EOF'
+          module.exports = {
+            ci: {
+              collect: {
+                url: [process.env.BASE_URL || 'https://www.zaproxy.org'],
+                numberOfRuns: 1,
+              },
+              upload: {
+                target: 'temporary-public-storage',
+              },
+            },
+          };
+          EOF
+
       - name: 🔍 Run Lighthouse
         uses: treosh/lighthouse-ci-action@v12
         with:
@@ -328,7 +344,13 @@ jobs:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: 🔧 Create ZAP rules file
+      - name: 🔧 Fix workspace permissions
+        run: |
+          # Fix GitHub Actions workspace permissions for ZAP
+          sudo chown -R $USER:$USER ${{ github.workspace }}
+          chmod -R 755 ${{ github.workspace }}
+
+      - name: 🔧 Create ZAP workspace and rules
         run: |
           mkdir -p .zap
           cat > .zap/rules.tsv << 'EOF'
@@ -340,10 +362,12 @@ jobs:
       - name: 🔐 Run OWASP ZAP Baseline Scan
         uses: zaproxy/action-baseline@v0.12.0
         with:
-          target: ${{ secrets.STAGING_BASE_URL || 'https://staging.example.com' }}
+          token: ${{ github.token }}
+          target: ${{ secrets.STAGING_BASE_URL }}
           rules_file_name: '.zap/rules.tsv'
           cmd_options: '-a -j'
           fail_action: false
+          allow_issue_writing: false
 
       - name: 📊 Upload ZAP results
         uses: actions/upload-artifact@v4
@@ -354,6 +378,41 @@ jobs:
             report_html.html
             report_json.json
             report_md.md
+          retention-days: 30
+
+  # Alternative Security Testing - More Reliable
+  security-nuclei:
+    name: 🔐 Nuclei Security Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    continue-on-error: true
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔧 Install Nuclei
+        run: |
+          wget -q https://github.com/projectdiscovery/nuclei/releases/latest/download/nuclei_2.9.15_linux_amd64.zip
+          unzip nuclei_2.9.15_linux_amd64.zip
+          chmod +x nuclei
+          sudo mv nuclei /usr/local/bin/
+
+      - name: 🔐 Run Nuclei Security Scan
+        run: |
+          TARGET_URL="${{ secrets.STAGING_BASE_URL || 'https://www.zaproxy.org' }}"
+          echo "Scanning: $TARGET_URL"
+          nuclei -u "$TARGET_URL" -t cves/ -t vulnerabilities/ -j -o nuclei-report.json || true
+          nuclei -u "$TARGET_URL" -t cves/ -t vulnerabilities/ -o nuclei-report.txt || true
+
+      - name: 📊 Upload Nuclei results
+        uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: nuclei-security-report-${{ github.run_id }}
+          path: |
+            nuclei-report.json
+            nuclei-report.txt
           retention-days: 30
 
   report:
