@@ -137,3 +137,88 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+
+# ========================================
+# Playwright Specific
+# ========================================
+
+# Playwright Test Results
+test-results/
+playwright-report/
+blob-report/
+
+# Playwright Screenshots and Videos
+screenshots/
+videos/
+test-results/
+
+# Playwright Trace Files
+traces/
+*.trace
+
+# Playwright Browser Downloads
+/browsers/
+/.browsers/
+/ms-playwright/
+
+# Playwright Cache
+.playwright/
+playwright/.auth/
+
+# Playwright Global Setup State
+global-setup-state.json
+storage-state.json
+
+# Playwright Debug Logs
+DEBUG=pw:*
+
+# Playwright Visual Comparison
+*-actual.png
+*-expected.png
+*-diff.png
+
+# Test artifacts
+test-artifacts/
+artifacts/
+
+# Allure Results (if using Allure reporting)
+allure-results/
+allure-report/
+
+# Custom Playwright Config backups
+playwright.config.*.bak
+
+# Lighthouse CI
+.lighthouseci/
+
+# Performance profiles
+*.cpuprofile
+*.heapprofile
+
+# Local Playwright auth tokens
+.auth/
+auth-storage/
+
+# Test fixtures downloads
+fixtures/downloads/
+downloads/
+
+# HAR files
+*.har
+
+# WebM video files from test recordings
+*.webm
+
+# Temporary test files
+temp/
+tmp/
+.tmp/
+
+# Network mocking files (if using MSW or similar)
+mocks/recordings/
+
+# Test environment specific
+.env.local
+.env.development
+.env.testing
+.env.production
