@@ -31,7 +31,6 @@ on:
 
 env:
   NODE_VERSION: '20'
-  # Don't pin Playwright version - let package.json control it
   FORCE_COLOR: 1
   CI: true
 
@@ -415,8 +414,8 @@ jobs:
     
     steps:
       - name: 📧 Send email notification
-        if: secrets.EMAIL_USERNAME != '' && secrets.NOTIFICATION_EMAIL != ''
         uses: dawidd6/action-send-mail@v3
+        continue-on-error: true
         with:
           server_address: smtp.gmail.com
           server_port: 587
@@ -437,8 +436,8 @@ jobs:
           from: "GitHub Actions <${{ secrets.EMAIL_USERNAME }}>"
 
       - name: 💬 Slack notification
-        if: secrets.SLACK_WEBHOOK_URL != ''
         uses: 8398a7/action-slack@v3
+        continue-on-error: true
         with:
           status: failure
           channel: '#qa-alerts'
